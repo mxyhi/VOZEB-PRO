@@ -31,6 +31,10 @@ VOZEB-PRO项目缺陷检查报告.md
 商业落地和用户体验评估报告.md
 商业版功能缺口分析报告.md
 项目文件流程图.md
+/task_plan.md
+/findings.md
+/progress.md
+.planning/
 scripts/capture-readme-screenshots.mjs
 **/__pycache__/
 *.pyc
