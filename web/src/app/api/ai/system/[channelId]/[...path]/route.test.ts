@@ -35,7 +35,7 @@ vi.mock("@/lib/server/security", () => ({
 import { GET, maxDuration, POST, PUT } from "./route";
 import { CREATIVE_UPLOAD_MAX_BYTES } from "@/lib/creative-upload";
 import { MEDIA_SNIFF_RANGE } from "@/lib/server/media-content-validation";
-import { SYSTEM_PROXY_JSON_BODY_MAX_BYTES } from "@/lib/server/system-proxy-request-limits";
+import { SYSTEM_PROXY_JSON_BODY_MAX_BYTES, SYSTEM_PROXY_MULTIPART_BODY_MAX_BYTES } from "@/lib/server/system-proxy-request-limits";
 import { systemAiBillingHeaders, systemAiPointsIdempotencyKey } from "@/lib/server/system-ai-billing";
 
 const context = { params: Promise.resolve({ channelId: "channel-one", path: ["_media"] }) };
@@ -47,6 +47,35 @@ describe("system generation proxy runtime", () => {
 
     it("accepts the JSON expansion of one maximum-size visual reference", () => {
         expect(SYSTEM_PROXY_JSON_BODY_MAX_BYTES).toBeGreaterThan(Math.ceil((CREATIVE_UPLOAD_MAX_BYTES * 4) / 3));
+    });
+
+    it("accepts three maximum-size image references in one multipart edit", () => {
+        expect(SYSTEM_PROXY_MULTIPART_BODY_MAX_BYTES).toBe(100 * 1024 * 1024);
+        expect(SYSTEM_PROXY_MULTIPART_BODY_MAX_BYTES).toBeGreaterThanOrEqual(CREATIVE_UPLOAD_MAX_BYTES * 3);
+    });
+
+    it("rejects an oversized image-edit multipart before calling the upstream", async () => {
+        mocks.getAuthSettings.mockResolvedValue({
+            generationPointMultipliers: {},
+            logicalModels: [],
+            systemChannels: [{ id: "channel-one", enabled: true, baseUrl: "https://api.example.com/v1", apiKey: "secret", apiFormat: "openai", models: ["gpt-image-2"] }],
+        });
+        const fetchMock = vi.spyOn(globalThis, "fetch");
+        const response = await POST(
+            new Request("http://localhost/api/ai/system/channel-one/images/edits", {
+                method: "POST",
+                headers: {
+                    "content-type": "multipart/form-data; boundary=x",
+                    "content-length": String(SYSTEM_PROXY_MULTIPART_BODY_MAX_BYTES + 1),
+                },
+                body: "--x--\r\n",
+            }),
+            { params: Promise.resolve({ channelId: "channel-one", path: ["images", "edits"] }) },
+        );
+
+        expect(response.status).toBe(413);
+        await expect(response.json()).resolves.toEqual({ error: "请求体过大" });
+        expect(fetchMock).not.toHaveBeenCalled();
     });
 });
 

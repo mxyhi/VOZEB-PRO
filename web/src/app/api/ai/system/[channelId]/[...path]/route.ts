@@ -21,7 +21,7 @@ import { channelConnectionReady, protocolAuthHeaders, resolveChannelModelConfig 
 import { normalizeYumengModelCenterBaseUrl } from "@/lib/yumeng-model-center";
 import { authorizedWorkerUserId } from "@/lib/server/maintenance-auth";
 import { authorizeGenerationMediaProxyRequest } from "@/lib/server/generation-media-access";
-import { SYSTEM_PROXY_JSON_BODY_MAX_BYTES } from "@/lib/server/system-proxy-request-limits";
+import { SYSTEM_PROXY_JSON_BODY_MAX_BYTES, SYSTEM_PROXY_MULTIPART_BODY_MAX_BYTES } from "@/lib/server/system-proxy-request-limits";
 import { userOwnsGenerationUpstreamTask } from "@/lib/server/generation-task-authorization";
 import { authorizeSystemAiProxyRequest } from "@/lib/server/system-ai-proxy-policy";
 
@@ -36,7 +36,6 @@ type RouteContext = {
 };
 type PointsRequest = { model: string; amount: number; usageKind: PointUsageKind };
 type ProxyRequestBody = { body?: BodyInit; pointsPayload?: ArrayBuffer | Record<string, unknown>; bodyDigest: string };
-const MAX_PROXY_MULTIPART_BYTES = 25 * 1024 * 1024;
 const SYSTEM_MEDIA_TIMEOUT_MS = 30 * 1000;
 const MAX_SYSTEM_MEDIA_REDIRECTS = 4;
 
@@ -88,7 +87,10 @@ async function proxySystemRequest(request: Request, context: RouteContext) {
     try {
         requestBody = await readProxyRequestBody(request, isMultipart);
     } catch (error) {
-        if (error instanceof RequestBodyTooLargeError) return NextResponse.json({ error: error.message }, { status: error.status });
+        if (error instanceof RequestBodyTooLargeError) {
+            console.warn("System API proxy request body too large", { channelId, multipart: isMultipart, contentLength: request.headers.get("content-length") });
+            return NextResponse.json({ error: error.message }, { status: error.status });
+        }
         throw error;
     }
     const upstreamModel = readRequestModel(readRequestBody(contentType, requestBody.pointsPayload)) || request.headers.get(SYSTEM_AI_UPSTREAM_MODEL_HEADER)?.trim() || readPathModel(path);
@@ -381,7 +383,7 @@ function mediaResponseHeaders(headers: Headers, mimeType: string) {
 
 async function readProxyRequestBody(request: Request, isMultipart: boolean): Promise<ProxyRequestBody> {
     if (request.method === "GET" || request.method === "HEAD") return { bodyDigest: emptyBodyDigest() };
-    const bytes = await readRequestBodyBytes(request, isMultipart ? MAX_PROXY_MULTIPART_BYTES : SYSTEM_PROXY_JSON_BODY_MAX_BYTES);
+    const bytes = await readRequestBodyBytes(request, isMultipart ? SYSTEM_PROXY_MULTIPART_BODY_MAX_BYTES : SYSTEM_PROXY_JSON_BODY_MAX_BYTES);
     if (!isMultipart) {
         const body = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
         return { body, pointsPayload: body, bodyDigest: digestBytes(bytes) };
