@@ -236,7 +236,7 @@ function BindingEditor({ binding, capability, channels, onChange }: { binding: L
     const profile = binding.capabilityProfile || {};
     const effectiveAsync = profile.supportsAsync ?? (capability === "image" || capability === "video");
     const timeoutSeconds = profile.timeoutMs ? Math.round(profile.timeoutMs / 1000) : undefined;
-    const defaultTimeoutSeconds = capability === "image" ? 600 : capability === "text" ? 180 : 1800;
+    const defaultTimeoutSeconds = capability === "image" || capability === "text" ? 600 : 1800;
     const updateProfile = (patch: Partial<LogicalModelCapabilityProfile>) => onChange({ capabilityProfile: { ...profile, ...patch } });
     const updateList = (value: string) =>
         updateProfile({

@@ -22,7 +22,8 @@ type TextTaskPayload = {
 };
 
 const TEXT_TASK_POLL_INTERVAL_MS = 1500;
-const TEXT_TASK_TIMEOUT_MS = 3 * 60 * 1000;
+// 超时由服务端按模型配置判定（默认 10 分钟、上限 30 分钟），前端轮询只做兜底。
+const TEXT_TASK_TIMEOUT_MS = 31 * 60 * 1000;
 
 export async function createTextGenerationTask(config: AiConfig, messages: AiTextMessage[], options?: RequestOptions): Promise<TextGenerationTask> {
     const requestConfig = resolveModelRequestConfig(config, config.model || config.textModel);

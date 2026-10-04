@@ -5,13 +5,15 @@ import { DEFAULT_MODEL_REQUEST_TIMEOUT_MS, resolveModelPollingAttempts, resolveM
 
 describe("model request policy", () => {
     it("uses commercial defaults when a binding has no timeout override", () => {
-        expect(resolveModelRequestTimeoutMs(undefined, "text")).toBe(DEFAULT_MODEL_REQUEST_TIMEOUT_MS.text);
+        expect(resolveModelRequestTimeoutMs(undefined, "text")).toBe(10 * 60_000);
+        expect(resolveModelRequestTimeoutMs({ capabilityProfile: {} }, "text")).toBe(DEFAULT_MODEL_REQUEST_TIMEOUT_MS.text);
         expect(resolveModelRequestTimeoutMs(undefined, "image")).toBe(10 * 60_000);
     });
 
-    it("keeps every text model attempt at three minutes", () => {
-        expect(resolveModelRequestTimeoutMs({ capabilityProfile: { timeoutMs: 15_000 } }, "text")).toBe(3 * 60_000);
-        expect(resolveModelRequestTimeoutMs({ capabilityProfile: { timeoutMs: 8 * 60_000 } }, "text")).toBe(3 * 60_000);
+    it("applies and bounds a text binding timeout", () => {
+        expect(resolveModelRequestTimeoutMs({ capabilityProfile: { timeoutMs: 15_000 } }, "text")).toBe(15_000);
+        expect(resolveModelRequestTimeoutMs({ capabilityProfile: { timeoutMs: 15 * 60_000 } }, "text")).toBe(15 * 60_000);
+        expect(resolveModelRequestTimeoutMs({ capabilityProfile: { timeoutMs: 60 * 60_000 } }, "text")).toBe(30 * 60_000);
     });
 
     it("applies and bounds a binding timeout", () => {

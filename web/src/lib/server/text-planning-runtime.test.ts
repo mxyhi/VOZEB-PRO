@@ -376,15 +376,15 @@ describe("text planning runtime protocol matrix", () => {
         await expect(requestStructuredText(requestInput(candidate("newapi")))).rejects.toThrow("文本模型规划响应超时");
     });
 
-    it("所有文本规划候选都使用三分钟超时", async () => {
+    it("文本规划候选默认使用十分钟超时，并遵循绑定的超时配置", async () => {
         const timeoutSpy = vi.spyOn(AbortSignal, "timeout");
         mockedFetch.mockResolvedValueOnce(chatJsonResponse()).mockResolvedValueOnce(chatJsonResponse());
 
         await requestStructuredText(requestInput(candidate("newapi")));
-        await requestStructuredText(requestInput({ ...candidate("newapi", { id: "long-reasoning" }), capabilityProfile: { timeoutMs: 8 * 60_000 } }));
+        await requestStructuredText(requestInput({ ...candidate("newapi", { id: "long-reasoning" }), capabilityProfile: { timeoutMs: 15 * 60_000 } }));
 
-        expect(timeoutSpy).toHaveBeenNthCalledWith(1, 3 * 60_000);
-        expect(timeoutSpy).toHaveBeenNthCalledWith(2, 3 * 60_000);
+        expect(timeoutSpy).toHaveBeenNthCalledWith(1, 10 * 60_000);
+        expect(timeoutSpy).toHaveBeenNthCalledWith(2, 15 * 60_000);
     });
 
     it("增量解析 Chat SSE 中的结构化 JSON", async () => {
