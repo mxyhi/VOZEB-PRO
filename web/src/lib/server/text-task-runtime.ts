@@ -10,7 +10,8 @@ import { getTextTask, transitionTextTask, type TextTask, type TextTaskConfig } f
 import { updateTextTask } from "@/lib/server/text-task-store";
 import type { AiTextMessage } from "@/types/ai";
 import { hasSystemAiCharge, readSystemAiBilling, systemAiBillingHeaders } from "@/lib/server/system-ai-billing";
-import { resolveModelRequestTimeoutMs } from "@/lib/server/model-request-policy";
+import { resolveModelRequestTimeoutMs, TEXT_STREAM_IDLE_TIMEOUT_MS } from "@/lib/server/model-request-policy";
+import { isEventStreamResponse, readTextEventStream, TextStreamIdleTimeoutError, TextStreamUpstreamError, type TextStreamKind } from "@/lib/server/text-task-stream";
 import { buildProviderRequest, isProviderBusinessError, providerQueryPaths, readProviderError, readProviderString } from "@/lib/server/provider-task-config";
 import { maintenanceWorkerContextHeaders } from "@/lib/server/maintenance-auth";
 import { GenerationSubmissionSafeFailure, GenerationSubmissionUncertainError, generationSubmissionResponseError, generationSubmissionUncertainError } from "@/lib/server/generation-submission-error";
@@ -24,6 +25,7 @@ const TASK_ID_KEYS = ["task_id", "taskId", "id", "job_id", "jobId", "request_id"
 const TASK_STATUS_KEYS = ["status", "state", "task_status", "taskStatus"];
 const FAILED_TASK_STATUSES = new Set(["failed", "failure", "error", "cancelled", "canceled", "expired"]);
 const PENDING_TASK_STATUSES = new Set(["", "pending", "queued", "running", "processing", "in_progress", "created", "submitted"]);
+const STREAM_UNSUPPORTED_STATUSES = new Set([400, 404, 405, 415, 422, 501]);
 
 export type TextTaskStep = { state: "pending"; status: string; upstreamTaskId: string; createPath: string } | { state: "completed" } | { state: "failed"; error: string } | { state: "needs_review"; error: string };
 
@@ -114,32 +116,83 @@ function runResolvedTextTask(task: TextTask, origin: string, cookie: string, pro
 
 async function runOpenAiResponsesTask(task: TextTask, origin: string, cookie: string, protocol: ResolvedTextProtocol) {
     const config = task.config;
-    const headers = taskHeaders(config, cookie, pointsIdempotencyKey(task, protocol));
+    return runOpenAiTextTask(task, origin, cookie, protocol, "responses", { model: config.model, input: toResponseInput(withSystemMessage(config, task.messages)) });
+}
+
+async function runOpenAiChatCompletionTask(task: TextTask, origin: string, cookie: string, protocol: ResolvedTextProtocol) {
+    const config = task.config;
+    return runOpenAiTextTask(task, origin, cookie, protocol, "chat", { model: config.model, messages: toChatMessages(withSystemMessage(config, task.messages)) });
+}
+
+// Chat / Responses 优先流式请求：持续有输出时中间层不会因空闲断开，上游卡住时也能按空闲超时尽快切换备用模型。
+async function runOpenAiTextTask(task: TextTask, origin: string, cookie: string, protocol: ResolvedTextProtocol, kind: TextStreamKind, body: Record<string, unknown>) {
+    const idempotencyKey = pointsIdempotencyKey(task, protocol);
+    if (!textStreamEnabled(task.config, protocol)) return readOpenAiTextResponse(task, await postOpenAiText(task, origin, cookie, protocol.path, body, idempotencyKey), kind);
+    const streamPath = task.config.advancedConfig?.streaming?.path?.trim() || protocol.path;
+    const streamed = await postOpenAiText(task, origin, cookie, streamPath, { ...body, stream: true }, `${idempotencyKey}:stream`);
+    if (!STREAM_UNSUPPORTED_STATUSES.has(streamed.status)) return readOpenAiTextResponse(task, streamed, kind);
+    // 上游明确拒绝流式参数时，同一候选退回一次非流式请求；计费幂等键不同，避免与流式请求冲突。
+    const rejected = await readFetchError(streamed, "文本生成失败");
+    console.warn("Text task stream rejected, retrying without stream", { taskId: task.id, status: streamed.status, error: rejected });
+    return readOpenAiTextResponse(task, await postOpenAiText(task, origin, cookie, protocol.path, body, idempotencyKey), kind);
+}
+
+function textStreamEnabled(config: TextTaskConfig, protocol: ResolvedTextProtocol) {
+    // GlobalAiOpc 原生 Gemini/Claude 由系统代理把 Chat 改写成非流式请求，不能透传流式参数。
+    if (protocol.providerKind !== protocol.kind) return false;
+    return config.advancedConfig?.streaming?.enabled !== false;
+}
+
+async function postOpenAiText(task: TextTask, origin: string, cookie: string, path: string, body: Record<string, unknown>, idempotencyKey: string) {
+    const config = task.config;
+    const headers = taskHeaders(config, cookie, idempotencyKey);
     headers.set("content-type", "application/json");
-    const response = await submissionFetch(config, taskUrl(config, protocol.path, origin), {
-        method: "POST",
-        headers,
-        body: JSON.stringify({ model: config.model, input: toResponseInput(withSystemMessage(config, task.messages)) }),
-        cache: "no-store",
-    });
+    return submissionFetch(config, taskUrl(config, path, origin), { method: "POST", headers, body: JSON.stringify(body), cache: "no-store" });
+}
+
+async function readOpenAiTextResponse(task: TextTask, response: Response, kind: TextStreamKind) {
     if (!response.ok) {
-        const errorMessage = await readFetchError(response, "文本生成失败");
-        throw new GenerationSubmissionSafeFailure(errorMessage, response.status);
+        const message = await readFetchError(response, "文本生成失败");
+        throw new GenerationSubmissionSafeFailure(message, response.status);
     }
-    const payload = await parseTextSubmissionJson<ResponseApiPayload>(task, response);
-    try {
-        validateResponsePayload(payload);
-    } catch (error) {
-        const message = error instanceof Error ? error.message : "文本生成失败";
-        await refundChargedTextResponse(task, response.headers);
-        throw new GenerationSubmissionSafeFailure(message);
-    }
-    const content = parseOpenAiContent(payload);
+    const content = isEventStreamResponse(response) ? await readStreamedText(task, response, kind) : await readCompletedText(task, response, kind);
     if (!content.trim()) {
         await refundChargedTextResponse(task, response.headers);
         throw new GenerationSubmissionSafeFailure("文本模型没有返回有效内容");
     }
     return { content, ...readBilling(response.headers) };
+}
+
+async function readCompletedText(task: TextTask, response: Response, kind: TextStreamKind) {
+    const payload = await parseTextSubmissionJson<ChatCompletionPayload & ResponseApiPayload>(task, response);
+    try {
+        validateOpenAiPayload(payload);
+    } catch (error) {
+        await refundChargedTextResponse(task, response.headers);
+        throw new GenerationSubmissionSafeFailure(error instanceof Error ? error.message : "文本生成失败");
+    }
+    return kind === "chat" ? parseChatCompletionContent(payload) : parseOpenAiContent(payload);
+}
+
+async function readStreamedText(task: TextTask, response: Response, kind: TextStreamKind) {
+    try {
+        return await readTextEventStream(response, kind, TEXT_STREAM_IDLE_TIMEOUT_MS);
+    } catch (error) {
+        // 系统代理在上游返回 2xx 时已结算积分，流式阶段的确定性失败需要在这里退款后再切换备用模型。
+        if (error instanceof TextStreamIdleTimeoutError || isTextRequestTimeout(error)) {
+            console.warn("Text task stream timed out", { taskId: task.id, error: error instanceof Error ? error.message : String(error) });
+            await refundChargedTextResponse(task, response.headers);
+            throw new GenerationSubmissionSafeFailure("文本模型响应超时，正在切换备用模型", 504);
+        }
+        if (error instanceof TextStreamUpstreamError) {
+            await refundChargedTextResponse(task, response.headers);
+            throw new GenerationSubmissionSafeFailure(error.message);
+        }
+        // 连接中途断开时上游可能已完成并计费，沿用现有策略转人工确认，避免重复生成和扣费。
+        console.warn("Text task stream interrupted", { taskId: task.id, error: error instanceof Error ? error.message : String(error) });
+        await persistTextResponseBilling(task, response.headers);
+        throw new GenerationSubmissionUncertainError("文本流式响应中断，生成结果待确认");
+    }
 }
 
 async function createCustomTextTaskStep(task: TextTask, origin: string, cookie: string, protocol: ResolvedTextProtocol) {
@@ -227,35 +280,6 @@ export async function queryCancelledTextTaskUpstreamStep(task: TextTask, origin:
 function readMessageText(content: AiTextMessage["content"]) {
     if (typeof content === "string") return content;
     return content.map((item) => (item.type === "text" ? item.text : item.image_url.url)).join("\n");
-}
-
-async function runOpenAiChatCompletionTask(task: TextTask, origin: string, cookie: string, protocol: ResolvedTextProtocol) {
-    const config = task.config;
-    const headers = taskHeaders(config, cookie, pointsIdempotencyKey(task, protocol));
-    headers.set("content-type", "application/json");
-    const response = await submissionFetch(config, taskUrl(config, protocol.path, origin), {
-        method: "POST",
-        headers,
-        body: JSON.stringify({ model: config.model, messages: toChatMessages(withSystemMessage(config, task.messages)) }),
-        cache: "no-store",
-    });
-    if (!response.ok) {
-        const message = await readFetchError(response, "文本生成失败");
-        throw new GenerationSubmissionSafeFailure(message, response.status);
-    }
-    const payload = await parseTextSubmissionJson<ChatCompletionPayload>(task, response);
-    try {
-        validateChatCompletionPayload(payload);
-    } catch (error) {
-        await refundChargedTextResponse(task, response.headers);
-        throw new GenerationSubmissionSafeFailure(error instanceof Error ? error.message : "文本生成失败");
-    }
-    const content = parseChatCompletionContent(payload);
-    if (!content.trim()) {
-        await refundChargedTextResponse(task, response.headers);
-        throw new GenerationSubmissionSafeFailure("文本模型没有返回有效内容");
-    }
-    return { content, ...readBilling(response.headers) };
 }
 
 async function runGeminiTextTask(task: TextTask, origin: string, cookie: string, protocol: ResolvedTextProtocol) {
@@ -452,12 +476,7 @@ function parseGeminiContent(payload: GeminiPayload) {
     );
 }
 
-function validateResponsePayload(payload: ResponseApiPayload) {
-    if (typeof payload.code === "number" && payload.code !== 0) throw new Error(payload.msg || "请求失败");
-    if (payload.error?.message) throw new Error(payload.error.message);
-}
-
-function validateChatCompletionPayload(payload: ChatCompletionPayload) {
+function validateOpenAiPayload(payload: ChatCompletionPayload | ResponseApiPayload) {
     if (typeof payload.code === "number" && payload.code !== 0) throw new Error(payload.msg || "请求失败");
     if (payload.error?.message) throw new Error(payload.error.message);
 }

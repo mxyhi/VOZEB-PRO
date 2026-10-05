@@ -268,7 +268,7 @@ export function SystemChannelEditor({ channel, fetching, onChange, onDelete, onF
                         </LabeledControl>
                         {detectedCapabilities.has("text") ? (
                             <>
-                                <LabeledControl label="规划流式模式">
+                                <LabeledControl label="文本流式模式">
                                     <Select
                                         className="w-full"
                                         value={streamingMode(advanced.streaming)}
@@ -284,7 +284,7 @@ export function SystemChannelEditor({ channel, fetching, onChange, onDelete, onF
                                         }
                                     />
                                 </LabeledControl>
-                                <LabeledControl label="规划流式路径">
+                                <LabeledControl label="文本流式路径">
                                     <Input
                                         disabled={streamingMode(advanced.streaming) !== "enabled"}
                                         value={advanced.streaming?.path || ""}

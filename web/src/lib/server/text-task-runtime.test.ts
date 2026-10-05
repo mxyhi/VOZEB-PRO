@@ -80,6 +80,125 @@ describe("text task runtime recovery", () => {
         }
     });
 
+    it("streams Chat Completions through a live fixture and assembles the deltas", async () => {
+        const fixture = createProtocolFixtureServer();
+        await new Promise<void>((resolve) => fixture.server.listen(0, "127.0.0.1", resolve));
+        const address = fixture.server.address();
+        if (!address || typeof address === "string") throw new Error("Protocol fixture did not bind a TCP port");
+        state = textTask(openAiConfig("fixture-text", `http://127.0.0.1:${address.port}/v1`));
+
+        try {
+            await expect(runTextTaskStep(state, "http://internal", "")).resolves.toEqual({ state: "completed" });
+            expect(state.result?.content).toBe("协议测试文本返回成功");
+            expect(JSON.parse(fixture.requests[0]?.body.toString("utf8") || "{}")).toMatchObject({ model: "text-model", stream: true });
+        } finally {
+            await new Promise<void>((resolve, reject) => fixture.server.close((error) => (error ? reject(error) : resolve())));
+        }
+    });
+
+    it("assembles Responses stream deltas and stops at response.completed", async () => {
+        state = textTask(responsesConfig("channel-one", "https://one.example"));
+        const fetchMock = vi.fn().mockResolvedValueOnce(
+            sseResponse([
+                { type: "response.created" },
+                { type: "response.output_text.delta", delta: "长推理" },
+                { type: "response.output_text.delta", delta: "结果" },
+                { type: "response.output_text.done", text: "长推理结果" },
+                { type: "response.completed" },
+            ]),
+        );
+        vi.stubGlobal("fetch", fetchMock);
+
+        await expect(runTextTaskStep(state, "http://internal", "")).resolves.toEqual({ state: "completed" });
+        expect(state.result?.content).toBe("长推理结果");
+        expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toMatchObject({ stream: true });
+    });
+
+    it("falls back to a non-stream request when the upstream rejects streaming", async () => {
+        const fetchMock = vi
+            .fn()
+            .mockResolvedValueOnce(Response.json({ error: { message: "stream is not supported" } }, { status: 400 }))
+            .mockResolvedValueOnce(Response.json({ choices: [{ message: { content: "非流式结果" } }] }));
+        vi.stubGlobal("fetch", fetchMock);
+        state = textTask(openAiConfig("channel-one", "https://one.example"));
+
+        await expect(runTextTaskStep(state, "http://internal", "")).resolves.toEqual({ state: "completed" });
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+        expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toMatchObject({ stream: true });
+        expect(JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body))).not.toHaveProperty("stream");
+        expect(state.result?.content).toBe("非流式结果");
+    });
+
+    it("does not request streaming when the channel disables it", async () => {
+        state = textTask({ ...openAiConfig("channel-one", "https://one.example"), advancedConfig: { ...emptyAdvancedConfig(), protocol: "openai", streaming: { enabled: false } } });
+        const fetchMock = vi.fn().mockResolvedValueOnce(Response.json({ choices: [{ message: { content: "关闭流式" } }] }));
+        vi.stubGlobal("fetch", fetchMock);
+
+        await expect(runTextTaskStep(state, "http://internal", "")).resolves.toEqual({ state: "completed" });
+        expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).not.toHaveProperty("stream");
+    });
+
+    it("refunds and switches models when a stream reports an upstream error", async () => {
+        state = textTask(openAiConfig("channel-one", "https://one.example"), [openAiConfig("channel-two", "https://two.example")]);
+        const fetchMock = vi
+            .fn()
+            .mockResolvedValueOnce(sseResponse([{ choices: [{ delta: { content: "半截" } }] }, { error: { message: "upstream overloaded" } }], { "x-vozeb-pro-points-cost": "2", "x-vozeb-pro-points-record-id": "stream-error" }))
+            .mockResolvedValueOnce(sseResponse([{ choices: [{ delta: { content: "备用流式结果" } }] }, "[DONE]"]));
+        vi.stubGlobal("fetch", fetchMock);
+
+        await expect(runTextTaskStep(state, "http://internal", "")).resolves.toEqual({ state: "completed" });
+        expect(mocks.refund).toHaveBeenCalledWith("user-one", "text-model", 2, "text", 1, undefined, "stream-error");
+        expect(state.config.channelId).toBe("channel-two");
+        expect(state.attempts?.map(({ status }) => status)).toEqual(["failed", "succeeded"]);
+        expect(state.result?.content).toBe("备用流式结果");
+    });
+
+    it("refunds and switches models when a stream goes idle", async () => {
+        vi.useFakeTimers();
+        state = textTask(openAiConfig("channel-one", "https://one.example"), [openAiConfig("channel-two", "https://two.example")]);
+        const stalled = new Response(new ReadableStream({ start: (controller) => controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"思考中"}}]}\n\n')) }), {
+            headers: { "content-type": "text/event-stream", "x-vozeb-pro-points-cost": "3", "x-vozeb-pro-points-record-id": "stream-idle" },
+        });
+        const fetchMock = vi
+            .fn()
+            .mockResolvedValueOnce(stalled)
+            .mockResolvedValueOnce(sseResponse([{ choices: [{ delta: { content: "备用结果" } }] }, "[DONE]"]));
+        vi.stubGlobal("fetch", fetchMock);
+
+        try {
+            const step = runTextTaskStep(state, "http://internal", "");
+            await vi.advanceTimersByTimeAsync(3 * 60_000 + 1);
+            await expect(step).resolves.toEqual({ state: "completed" });
+        } finally {
+            vi.useRealTimers();
+        }
+        expect(mocks.refund).toHaveBeenCalledWith("user-one", "text-model", 3, "text", 1, undefined, "stream-idle");
+        expect(state.attempts?.[0]).toMatchObject({ status: "failed", error: "文本模型响应超时，正在切换备用模型" });
+        expect(state.result?.content).toBe("备用结果");
+    });
+
+    it("marks an interrupted stream for manual review without switching models", async () => {
+        state = textTask(openAiConfig("channel-one", "https://one.example"), [openAiConfig("channel-two", "https://two.example")]);
+        let sent = false;
+        const broken = new Response(
+            new ReadableStream({
+                pull(controller) {
+                    if (sent) return controller.error(new TypeError("terminated"));
+                    sent = true;
+                    controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"半截"}}]}\n\n'));
+                },
+            }),
+            { headers: { "content-type": "text/event-stream", "x-vozeb-pro-points-cost": "4", "x-vozeb-pro-points-record-id": "stream-broken" } },
+        );
+        const fetchMock = vi.fn().mockResolvedValueOnce(broken);
+        vi.stubGlobal("fetch", fetchMock);
+
+        await expect(runTextTaskStep(state, "http://internal", "")).resolves.toMatchObject({ state: "needs_review" });
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+        expect(state.billing).toEqual({ pointsCost: 4, pointsRecordId: "stream-broken", refunded: false });
+        expect(mocks.refund).not.toHaveBeenCalled();
+    });
+
     it("persists an asynchronous task ID and queries only one step per worker run", async () => {
         const fetchMock = vi
             .fn()
@@ -134,11 +253,13 @@ describe("text task runtime recovery", () => {
         const fetchMock = vi
             .fn()
             .mockResolvedValueOnce(Response.json({ error: { message: "参数不受支持" } }, { status: 422 }))
+            .mockResolvedValueOnce(Response.json({ error: { message: "参数不受支持" } }, { status: 422 }))
             .mockResolvedValueOnce(Response.json({ candidates: [{ content: { parts: [{ text: "备用渠道结果" }] } }] }));
         vi.stubGlobal("fetch", fetchMock);
 
         await expect(runTextTaskStep(state, "http://internal", "")).resolves.toEqual({ state: "completed" });
-        expect(fetchMock).toHaveBeenCalledTimes(2);
+        // 第一个渠道先流式、再非流式各被拒绝一次，然后才切换渠道。
+        expect(fetchMock).toHaveBeenCalledTimes(3);
         expect(state.config.channelId).toBe("channel-two");
         expect(state.attempts?.map(({ status }) => status)).toEqual(["failed", "succeeded"]);
         expect(state.result?.content).toBe("备用渠道结果");
@@ -163,13 +284,15 @@ describe("text task runtime recovery", () => {
         const fetchMock = vi
             .fn()
             .mockResolvedValueOnce(Response.json({ error: { message: "/backend-api/conversation failed: status=422, body=" } }, { status: 422 }))
+            .mockResolvedValueOnce(Response.json({ error: { message: "/backend-api/conversation failed: status=422, body=" } }, { status: 422 }))
             .mockResolvedValueOnce(Response.json({ choices: [{ message: { content: "Chat 兼容返回" } }] }));
         vi.stubGlobal("fetch", fetchMock);
 
         await expect(runTextTaskStep(state, "http://internal", "")).resolves.toEqual({ state: "completed" });
-        expect(fetchMock).toHaveBeenCalledTimes(2);
+        expect(fetchMock).toHaveBeenCalledTimes(3);
         expect(String(fetchMock.mock.calls[0]?.[0])).toBe("https://one.example/v1/responses");
-        expect(String(fetchMock.mock.calls[1]?.[0])).toBe("https://two.example/v1/chat/completions");
+        expect(String(fetchMock.mock.calls[1]?.[0])).toBe("https://one.example/v1/responses");
+        expect(String(fetchMock.mock.calls[2]?.[0])).toBe("https://two.example/v1/chat/completions");
         expect(state.config.channelId).toBe("channel-two");
         expect(state.attempts?.map(({ status }) => status)).toEqual(["failed", "succeeded"]);
         expect(state.result?.content).toBe("Chat 兼容返回");
@@ -231,6 +354,11 @@ describe("text task runtime recovery", () => {
         expect(mocks.refund).toHaveBeenCalledOnce();
     });
 });
+
+function sseResponse(events: Array<Record<string, unknown> | "[DONE]">, headers: Record<string, string> = {}) {
+    const body = events.map((event) => `data: ${event === "[DONE]" ? event : JSON.stringify(event)}\n\n`).join("");
+    return new Response(body, { headers: { "content-type": "text/event-stream", ...headers } });
+}
 
 function textTask(config: TextTaskConfig, candidateConfigs: TextTaskConfig[] = []): TextTask {
     return {
